@@ -1,2 +1,2 @@
-# Question-Bank-Generator
-creates mcqs automatically from the uploaded pdf
+# Advanced Question-Bank-Generator
+Creates MCQs automatically from the uploaded pdf or Book.
