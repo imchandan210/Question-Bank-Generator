@@ -1,1 +1,1439 @@
+import streamlit as st
+import pdfplumber
+import re
+import json
+import pandas as pd
+from io import BytesIO
+import time
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Tuple
+import random
+from datetime import datetime
+from collections import defaultdict
+import hashlib
+
+# Try imports
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+# Page configuration
+st.set_page_config(
+    page_title="AI Question Bank Extractor",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+SUBJECTS = {
+    "physics": {
+        "name": "Physics",
+        "icon": "⚛️",
+        "color": "#3B82F6",
+        "gradient": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+        "topics": ["Mechanics", "Thermodynamics", "Waves & Oscillations", "Optics", 
+                  "Electrostatics", "Current Electricity", "Magnetism", "Modern Physics",
+                  "Electromagnetic Waves", "Semiconductors"]
+    },
+    "chemistry": {
+        "name": "Chemistry", 
+        "icon": "🧪",
+        "color": "#10B981",
+        "gradient": "linear-gradient(135deg, #11998e 0%, #38ef7d 100%)",
+        "topics": ["Atomic Structure", "Chemical Bonding", "Thermodynamics", "Equilibrium",
+                  "Electrochemistry", "Chemical Kinetics", "Organic Chemistry", 
+                  "Inorganic Chemistry", "Coordination Compounds", "Polymers"]
+    },
+    "mathematics": {
+        "name": "Mathematics",
+        "icon": "📐", 
+        "color": "#F59E0B",
+        "gradient": "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)",
+        "topics": ["Algebra", "Calculus", "Coordinate Geometry", "Vectors & 3D",
+                  "Trigonometry", "Probability & Statistics", "Matrices", "Differential Equations"]
+    },
+    "biology": {
+        "name": "Biology",
+        "icon": "🧬",
+        "color": "#8B5CF6", 
+        "gradient": "linear-gradient(135deg, #a8edea 0%, #fed6e3 100%)",
+        "topics": ["Cell Biology", "Genetics", "Evolution", "Ecology", "Human Physiology",
+                  "Plant Physiology", "Biotechnology", "Reproduction", "Microorganisms"]
+    }
+}
+
+# ============================================================================
+# CUSTOM CSS
+# ============================================================================
+
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1.1rem;
+        color: #6B7280;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .stats-box {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .question-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+        margin-bottom: 1rem;
+        border-left: 4px solid #3B82F6;
+    }
+    .option-correct {
+        background: linear-gradient(90deg, #D1FAE5, #A7F3D0);
+        border-left: 4px solid #10B981;
+        padding: 12px 15px;
+        border-radius: 8px;
+        margin: 8px 0;
+        font-weight: 500;
+    }
+    .option-normal {
+        background-color: #F3F4F6;
+        padding: 12px 15px;
+        border-radius: 8px;
+        margin: 8px 0;
+    }
+    .solution-box {
+        background: linear-gradient(135deg, #FEF3C7 0%, #FDE68A 100%);
+        border-left: 4px solid #F59E0B;
+        padding: 15px;
+        border-radius: 8px;
+        margin-top: 15px;
+    }
+    .extraction-log {
+        background: #1F2937;
+        color: #10B981;
+        padding: 15px;
+        border-radius: 10px;
+        font-family: monospace;
+        font-size: 0.85rem;
+        max-height: 300px;
+        overflow-y: auto;
+    }
+    .status-success { color: #10B981; }
+    .status-warning { color: #F59E0B; }
+    .status-error { color: #EF4444; }
+    .status-info { color: #3B82F6; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
+@dataclass
+class Question:
+    """Complete question with all components"""
+    id: str
+    number: str
+    text: str
+    options: Dict[str, str]
+    correct_option: str = ""
+    correct_answer_text: str = ""
+    solution: str = ""
+    subject: str = ""
+    topic: str = ""
+    difficulty: str = "medium"
+    marks: int = 4
+    chapter: str = ""
+    exercise: str = ""
+    page_number: int = 0
+    source: str = "pdf"
+    
+    def to_dict(self):
+        return asdict(self)
+    
+    def get_hash(self) -> str:
+        content = f"{self.text}{json.dumps(self.options, sort_keys=True)}"
+        return hashlib.md5(content.encode()).hexdigest()[:12]
+
+
+@dataclass
+class SubjectRepository:
+    """Repository for a subject"""
+    subject: str
+    questions: List[Question] = field(default_factory=list)
+    topics: Dict[str, List[Question]] = field(default_factory=dict)
+    
+    def add_question(self, question: Question):
+        # Check for duplicates
+        existing_hashes = {q.get_hash() for q in self.questions}
+        if question.get_hash() not in existing_hashes:
+            self.questions.append(question)
+            
+            # Add to topic
+            topic = question.topic or "Uncategorized"
+            if topic not in self.topics:
+                self.topics[topic] = []
+            self.topics[topic].append(question)
+    
+    def total_questions(self) -> int:
+        return len(self.questions)
+
+
+@dataclass
+class QuestionBank:
+    """Master question bank"""
+    physics: SubjectRepository = field(default_factory=lambda: SubjectRepository("physics"))
+    chemistry: SubjectRepository = field(default_factory=lambda: SubjectRepository("chemistry"))
+    mathematics: SubjectRepository = field(default_factory=lambda: SubjectRepository("mathematics"))
+    biology: SubjectRepository = field(default_factory=lambda: SubjectRepository("biology"))
+    
+    def get_subject_repo(self, subject: str) -> SubjectRepository:
+        return getattr(self, subject, SubjectRepository(subject))
+    
+    def add_question(self, question: Question):
+        if question.subject in ["physics", "chemistry", "mathematics", "biology"]:
+            self.get_subject_repo(question.subject).add_question(question)
+    
+    def total_questions(self) -> int:
+        return (self.physics.total_questions() + self.chemistry.total_questions() + 
+                self.mathematics.total_questions() + self.biology.total_questions())
+
+
+# ============================================================================
+# AI-POWERED PDF EXTRACTOR
+# ============================================================================
+
+class AIQuestionExtractor:
+    """
+    AI-Powered Question Extraction System
+    Uses GPT-4 to intelligently extract questions, options, answers, and solutions
+    """
+    
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ValueError("OpenAI API key is required")
+        self.client = OpenAI(api_key=api_key)
+        self.extraction_log = []
+    
+    def log(self, message: str, level: str = "info"):
+        """Add to extraction log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.extraction_log.append({
+            "time": timestamp,
+            "level": level,
+            "message": message
+        })
+    
+    def extract_text_from_pdf(self, pdf_file) -> Dict:
+        """Extract all text from PDF with page mapping"""
+        self.log("Starting PDF text extraction...")
+        
+        pages = []
+        full_text = ""
+        
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                total_pages = len(pdf.pages)
+                self.log(f"PDF has {total_pages} pages")
+                
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    pages.append({
+                        "page_number": i + 1,
+                        "text": text
+                    })
+                    full_text += f"\n\n=== PAGE {i+1} ===\n\n{text}"
+                    
+            self.log(f"Extracted {len(full_text)} characters", "success")
+            
+            return {
+                "success": True,
+                "pages": pages,
+                "full_text": full_text,
+                "total_pages": total_pages
+            }
+            
+        except Exception as e:
+            self.log(f"PDF extraction error: {str(e)}", "error")
+            return {"success": False, "error": str(e)}
+    
+    def analyze_document_structure(self, text: str) -> Dict:
+        """Use AI to analyze document structure and find sections"""
+        self.log("Analyzing document structure with AI...")
+        
+        # Take a sample of the document for structure analysis
+        sample = text[:8000] if len(text) > 8000 else text
+        
+        prompt = """Analyze this educational document and identify its structure.
+
+DOCUMENT SAMPLE:
+\"\"\"
+{text}
+\"\"\"
+
+Identify and respond in JSON format:
+{{
+    "document_type": "textbook/question_paper/worksheet/other",
+    "has_exercises": true/false,
+    "has_answer_key": true/false,
+    "has_solutions": true/false,
+    "subjects_found": ["physics", "chemistry", "mathematics", "biology"],
+    "chapter_info": "chapter name if found",
+    "exercise_markers": ["Exercise", "Practice Problems", etc.],
+    "answer_key_markers": ["Answer Key", "Answers", etc.],
+    "solution_markers": ["Solutions", "Worked Examples", etc.],
+    "question_format": "numbered (1, 2, 3) / lettered (a, b, c) / roman (i, ii, iii)",
+    "option_format": "(A), (B), (C), (D) / (a), (b), (c), (d) / (1), (2), (3), (4)"
+}}
+
+Only respond with valid JSON.""".format(text=sample)
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing educational document structures. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=1000
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Extract JSON
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                structure = json.loads(json_match.group())
+                self.log(f"Document type: {structure.get('document_type', 'unknown')}", "success")
+                self.log(f"Has exercises: {structure.get('has_exercises', False)}", "info")
+                self.log(f"Has answer key: {structure.get('has_answer_key', False)}", "info")
+                self.log(f"Has solutions: {structure.get('has_solutions', False)}", "info")
+                return structure
+            
+            return {}
+            
+        except Exception as e:
+            self.log(f"Structure analysis error: {str(e)}", "error")
+            return {}
+    
+    def extract_questions_from_chunk(self, text: str, chunk_num: int, structure: Dict) -> List[Dict]:
+        """Extract questions from a text chunk using AI"""
+        self.log(f"Processing chunk {chunk_num}...")
+        
+        prompt = """Extract ALL MCQ questions from this text. This is from an educational document.
+
+TEXT:
+\"\"\"
+{text}
+\"\"\"
+
+IMPORTANT INSTRUCTIONS:
+1. Find EVERY question with multiple choice options (A, B, C, D or 1, 2, 3, 4)
+2. Extract the complete question text
+3. Extract ALL options exactly as written
+4. Look for the correct answer if marked
+5. Include any solution or explanation if present
+
+Respond with a JSON array of questions:
+{{
+    "questions": [
+        {{
+            "question_number": "1",
+            "question_text": "Complete question text here",
+            "options": {{
+                "A": "First option text",
+                "B": "Second option text", 
+                "C": "Third option text",
+                "D": "Fourth option text"
+            }},
+            "correct_option": "A/B/C/D or empty if not found",
+            "solution": "Solution or explanation if found, otherwise empty",
+            "topic": "Topic if identifiable"
+        }}
+    ]
+}}
+
+Extract ALL questions you can find. If no questions found, return {{"questions": []}}
+Only respond with valid JSON.""".format(text=text)
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting MCQ questions from educational content. Extract every question with its options, correct answer, and solution. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=4000
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Extract JSON
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                data = json.loads(json_match.group())
+                questions = data.get("questions", [])
+                self.log(f"Found {len(questions)} questions in chunk {chunk_num}", "success")
+                return questions
+            
+            return []
+            
+        except Exception as e:
+            self.log(f"Chunk {chunk_num} error: {str(e)}", "error")
+            return []
+    
+    def extract_answer_key(self, text: str) -> Dict[str, str]:
+        """Extract answer key from document"""
+        self.log("Extracting answer key...")
+        
+        # Look for answer key section
+        answer_patterns = [
+            r'(?i)answer\s*key[:\s]*(.{500,3000})',
+            r'(?i)answers?[:\s]*\n(.{200,2000})',
+            r'(?i)solution\s*key[:\s]*(.{500,3000})',
+        ]
+        
+        answer_section = ""
+        for pattern in answer_patterns:
+            match = re.search(pattern, text)
+            if match:
+                answer_section = match.group(1)
+                break
+        
+        if not answer_section:
+            # Try to find answers at the end of document
+            answer_section = text[-5000:] if len(text) > 5000 else text
+        
+        prompt = """Extract the answer key from this text. Find all question numbers and their correct answers.
+
+TEXT:
+\"\"\"
+{text}
+\"\"\"
+
+Respond with JSON mapping question numbers to correct options:
+{{
+    "1": "A",
+    "2": "B",
+    "3": "C",
+    ...
+}}
+
+Only include answers you are confident about. Respond with valid JSON only.""".format(text=answer_section)
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting answer keys from educational documents. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=2000
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                answers = json.loads(json_match.group())
+                self.log(f"Found {len(answers)} answers in answer key", "success")
+                return answers
+            
+            return {}
+            
+        except Exception as e:
+            self.log(f"Answer key extraction error: {str(e)}", "error")
+            return {}
+    
+    def extract_solutions(self, text: str, question_numbers: List[str]) -> Dict[str, str]:
+        """Extract solutions for questions"""
+        self.log("Extracting solutions...")
+        
+        # Look for solutions section
+        solution_patterns = [
+            r'(?i)solutions?[:\s]*\n([\s\S]{1000,})',
+            r'(?i)hints?\s*and\s*solutions?[:\s]*\n([\s\S]{1000,})',
+            r'(?i)worked\s*solutions?[:\s]*\n([\s\S]{1000,})',
+            r'(?i)detailed\s*solutions?[:\s]*\n([\s\S]{1000,})',
+        ]
+        
+        solution_section = ""
+        for pattern in solution_patterns:
+            match = re.search(pattern, text)
+            if match:
+                solution_section = match.group(1)
+                break
+        
+        if not solution_section:
+            self.log("No dedicated solutions section found", "warning")
+            return {}
+        
+        # Limit to reasonable size
+        solution_section = solution_section[:15000]
+        
+        prompt = """Extract solutions for each question from this solutions section.
+
+SOLUTIONS TEXT:
+\"\"\"
+{text}
+\"\"\"
+
+QUESTION NUMBERS TO FIND: {numbers}
+
+Respond with JSON mapping question numbers to their solutions:
+{{
+    "1": "Step-by-step solution for question 1...",
+    "2": "Solution for question 2...",
+    ...
+}}
+
+Include the complete solution/explanation for each question. Respond with valid JSON only.""".format(
+            text=solution_section,
+            numbers=", ".join(question_numbers[:50])  # Limit to 50
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting and matching solutions from educational documents. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=4000
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                solutions = json.loads(json_match.group())
+                self.log(f"Found solutions for {len(solutions)} questions", "success")
+                return solutions
+            
+            return {}
+            
+        except Exception as e:
+            self.log(f"Solutions extraction error: {str(e)}", "error")
+            return {}
+    
+    def classify_question(self, question_text: str, options: Dict[str, str]) -> Dict:
+        """Classify question by subject and topic"""
+        
+        combined = question_text + " " + " ".join(options.values())
+        
+        prompt = """Classify this question by subject and topic.
+
+QUESTION: {question}
+
+OPTIONS: {options}
+
+Respond with JSON:
+{{
+    "subject": "physics/chemistry/mathematics/biology",
+    "topic": "specific topic name",
+    "difficulty": "easy/medium/hard"
+}}
+
+Only respond with valid JSON.""".format(
+            question=question_text,
+            options=json.dumps(options)
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are an expert at classifying educational questions. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=200
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                return json.loads(json_match.group())
+            
+            return {"subject": "physics", "topic": "General", "difficulty": "medium"}
+            
+        except:
+            return {"subject": "physics", "topic": "General", "difficulty": "medium"}
+    
+    def process_complete_document(self, pdf_file, target_subject: str = None, 
+                                  progress_callback=None) -> List[Question]:
+        """
+        Complete document processing pipeline:
+        1. Extract text from PDF
+        2. Analyze document structure
+        3. Extract all questions
+        4. Extract answer key
+        5. Extract solutions
+        6. Combine everything
+        """
+        self.extraction_log = []
+        self.log("=" * 50)
+        self.log("STARTING AI-POWERED EXTRACTION")
+        self.log("=" * 50)
+        
+        # Step 1: Extract PDF text
+        if progress_callback:
+            progress_callback(0.1, "Extracting text from PDF...")
+        
+        pdf_data = self.extract_text_from_pdf(pdf_file)
+        
+        if not pdf_data["success"]:
+            self.log("Failed to extract PDF text", "error")
+            return []
+        
+        full_text = pdf_data["full_text"]
+        pages = pdf_data["pages"]
+        
+        # Step 2: Analyze structure
+        if progress_callback:
+            progress_callback(0.15, "Analyzing document structure...")
+        
+        structure = self.analyze_document_structure(full_text)
+        
+        # Step 3: Extract questions in chunks
+        if progress_callback:
+            progress_callback(0.2, "Extracting questions...")
+        
+        all_questions = []
+        
+        # Process text in chunks
+        chunk_size = 6000
+        chunks = []
+        current_chunk = ""
+        
+        for page in pages:
+            if len(current_chunk) + len(page["text"]) > chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = page["text"]
+            else:
+                current_chunk += "\n\n" + page["text"]
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        self.log(f"Processing {len(chunks)} text chunks...")
+        
+        for i, chunk in enumerate(chunks):
+            if progress_callback:
+                progress = 0.2 + (0.4 * (i + 1) / len(chunks))
+                progress_callback(progress, f"Processing chunk {i+1}/{len(chunks)}...")
+            
+            chunk_questions = self.extract_questions_from_chunk(chunk, i + 1, structure)
+            all_questions.extend(chunk_questions)
+            
+            # Rate limiting
+            time.sleep(0.5)
+        
+        if not all_questions:
+            self.log("No questions found in document", "warning")
+            return []
+        
+        self.log(f"Total questions extracted: {len(all_questions)}", "success")
+        
+        # Step 4: Extract answer key
+        if progress_callback:
+            progress_callback(0.65, "Extracting answer key...")
+        
+        answer_key = self.extract_answer_key(full_text)
+        
+        # Step 5: Extract solutions
+        if progress_callback:
+            progress_callback(0.75, "Extracting solutions...")
+        
+        question_numbers = [q.get("question_number", "") for q in all_questions]
+        solutions = self.extract_solutions(full_text, question_numbers)
+        
+        # Step 6: Combine everything and create Question objects
+        if progress_callback:
+            progress_callback(0.85, "Combining and classifying questions...")
+        
+        final_questions = []
+        
+        for i, q_data in enumerate(all_questions):
+            q_num = q_data.get("question_number", str(i + 1))
+            
+            # Get answer from answer key if not in question
+            correct = q_data.get("correct_option", "")
+            if not correct and q_num in answer_key:
+                correct = answer_key[q_num]
+            
+            # Get solution
+            solution = q_data.get("solution", "")
+            if not solution and q_num in solutions:
+                solution = solutions[q_num]
+            
+            # Classify question
+            classification = self.classify_question(
+                q_data.get("question_text", ""),
+                q_data.get("options", {})
+            )
+            
+            # Filter by subject if specified
+            if target_subject and classification["subject"] != target_subject:
+                continue
+            
+            question = Question(
+                id=f"Q{i+1:04d}",
+                number=q_num,
+                text=q_data.get("question_text", ""),
+                options=q_data.get("options", {}),
+                correct_option=correct.upper() if correct else "",
+                correct_answer_text=q_data.get("options", {}).get(correct.upper(), "") if correct else "",
+                solution=solution,
+                subject=classification.get("subject", "physics"),
+                topic=q_data.get("topic", "") or classification.get("topic", "General"),
+                difficulty=classification.get("difficulty", "medium"),
+                source="pdf"
+            )
+            
+            final_questions.append(question)
+        
+        if progress_callback:
+            progress_callback(1.0, "Extraction complete!")
+        
+        self.log(f"Final questions with answers: {len([q for q in final_questions if q.correct_option])}", "success")
+        self.log(f"Final questions with solutions: {len([q for q in final_questions if q.solution])}", "success")
+        self.log("=" * 50)
+        self.log("EXTRACTION COMPLETE")
+        self.log("=" * 50)
+        
+        return final_questions
+
+
+class AIImageExtractor:
+    """Extract questions from images using GPT-4 Vision"""
+    
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+    
+    def extract_from_image(self, image_bytes: bytes) -> Dict:
+        """Extract question from image"""
+        import base64
+        
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": """Extract the MCQ question from this image completely.
+
+Respond with JSON:
+{
+    "question_text": "Complete question text",
+    "options": {
+        "A": "Option A text",
+        "B": "Option B text",
+        "C": "Option C text",
+        "D": "Option D text"
+    },
+    "correct_option": "A/B/C/D if marked, else empty",
+    "solution": "Solution if visible, else empty",
+    "subject": "physics/chemistry/mathematics/biology",
+    "topic": "Topic name"
+}
+
+Only respond with valid JSON."""
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=1000
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                return {"success": True, "data": json.loads(json_match.group())}
+            
+            return {"success": False, "error": "Could not parse response"}
+            
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+
+def create_export(questions: List[Question], format_type: str) -> str:
+    """Create export in various formats"""
+    
+    if format_type == "json":
+        data = {
+            "generated_at": datetime.now().isoformat(),
+            "total_questions": len(questions),
+            "with_answers": len([q for q in questions if q.correct_option]),
+            "with_solutions": len([q for q in questions if q.solution]),
+            "questions": [q.to_dict() for q in questions]
+        }
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    
+    elif format_type == "csv":
+        data = []
+        for q in questions:
+            data.append({
+                "Number": q.number,
+                "Subject": q.subject.capitalize(),
+                "Topic": q.topic,
+                "Difficulty": q.difficulty,
+                "Question": q.text,
+                "Option_A": q.options.get('A', ''),
+                "Option_B": q.options.get('B', ''),
+                "Option_C": q.options.get('C', ''),
+                "Option_D": q.options.get('D', ''),
+                "Correct_Answer": q.correct_option,
+                "Solution": q.solution
+            })
+        return pd.DataFrame(data).to_csv(index=False)
+    
+    elif format_type == "txt":
+        lines = []
+        lines.append("=" * 70)
+        lines.append("QUESTION BANK")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"Total Questions: {len(questions)}")
+        lines.append("=" * 70)
+        
+        for q in questions:
+            lines.append(f"\n{'─' * 70}")
+            lines.append(f"Q{q.number}. [{q.subject.upper()} - {q.topic}] [{q.difficulty.upper()}]")
+            lines.append(f"{'─' * 70}")
+            lines.append(f"\n{q.text}\n")
+            
+            for opt in ['A', 'B', 'C', 'D']:
+                if opt in q.options:
+                    marker = "✓" if opt == q.correct_option else " "
+                    lines.append(f"  [{marker}] ({opt}) {q.options[opt]}")
+            
+            if q.correct_option:
+                lines.append(f"\n  ➤ Correct Answer: {q.correct_option}")
+            
+            if q.solution:
+                lines.append(f"\n  💡 Solution:\n  {q.solution}")
+        
+        return "\n".join(lines)
+    
+    return ""
+
+
+# ============================================================================
+# UI COMPONENTS
+# ============================================================================
+
+def display_extraction_log(log: List[Dict]):
+    """Display extraction log"""
+    log_html = '<div class="extraction-log">'
+    for entry in log:
+        level_class = f"status-{entry['level']}"
+        icon = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌"}.get(entry['level'], "")
+        log_html += f'<div class="{level_class}">[{entry["time"]}] {icon} {entry["message"]}</div>'
+    log_html += '</div>'
+    st.markdown(log_html, unsafe_allow_html=True)
+
+
+def display_question(q: Question, show_solution: bool = True):
+    """Display a single question"""
+    config = SUBJECTS.get(q.subject, {"color": "#6B7280", "name": q.subject.capitalize()})
+    
+    st.markdown(f"""
+    <div class="question-card" style="border-left-color: {config['color']};">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+            <span style="font-weight: bold; color: {config['color']};">
+                {config.get('icon', '📚')} Q{q.number} - {config['name']}
+            </span>
+            <span>
+                <span style="background: #E0E7FF; color: #4338CA; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem;">{q.topic}</span>
+                <span style="background: #FEF3C7; color: #92400E; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; margin-left: 5px;">{q.difficulty}</span>
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown(f"**{q.text}**")
+    
+    for opt in ['A', 'B', 'C', 'D']:
+        if opt in q.options:
+            if opt == q.correct_option:
+                st.markdown(f'<div class="option-correct">✅ ({opt}) {q.options[opt]}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="option-normal">⬜ ({opt}) {q.options[opt]}</div>', unsafe_allow_html=True)
+    
+    if q.correct_option:
+        st.success(f"**Correct Answer: {q.correct_option}**")
+    else:
+        st.warning("Answer not found")
+    
+    if show_solution and q.solution:
+        st.markdown(f'<div class="solution-box">💡 <strong>Solution:</strong><br>{q.solution}</div>', unsafe_allow_html=True)
+    elif show_solution and not q.solution:
+        st.info("Solution not available")
+
+
+def display_stats(bank: QuestionBank):
+    """Display statistics"""
+    cols = st.columns(4)
+    
+    for i, (subject, config) in enumerate(SUBJECTS.items()):
+        with cols[i]:
+            repo = bank.get_subject_repo(subject)
+            with_answers = len([q for q in repo.questions if q.correct_option])
+            
+            st.markdown(f"""
+            <div class="stats-box" style="border-left: 4px solid {config['color']};">
+                <h1 style="color: {config['color']}; margin: 0;">{config['icon']}</h1>
+                <h2 style="margin: 5px 0;">{repo.total_questions()}</h2>
+                <p style="margin: 0; color: #6B7280;">{config['name']}</p>
+                <small>{with_answers} with answers</small>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+# ============================================================================
+# MAIN PAGES
+# ============================================================================
+
+def pdf_extraction_page(bank: QuestionBank, api_key: str):
+    """Main PDF extraction page"""
+    
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%); 
+                padding: 2rem; border-radius: 15px; color: white; text-align: center; margin-bottom: 1.5rem;">
+        <h2>🤖 AI-Powered PDF Question Extractor</h2>
+        <p>Upload textbooks, question papers, or study materials</p>
+        <p style="font-size: 0.9rem; opacity: 0.8;">Automatically extracts questions, options, answers & solutions</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if not api_key:
+        st.error("⚠️ **OpenAI API Key Required!** Add your API key in the sidebar to use AI extraction.")
+        st.info("""
+        **How to get an API key:**
+        1. Go to [platform.openai.com](https://platform.openai.com)
+        2. Sign up or log in
+        3. Go to API Keys section
+        4. Create a new key
+        5. Paste it in the sidebar
+        """)
+        return
+    
+    # Upload section
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        uploaded_file = st.file_uploader(
+            "📄 Upload PDF File",
+            type=['pdf'],
+            help="Upload a textbook chapter, question paper, or study material"
+        )
+    
+    with col2:
+        st.markdown("**Options:**")
+        target_subject = st.selectbox(
+            "Filter by Subject",
+            ["All Subjects"] + list(SUBJECTS.keys()),
+            format_func=lambda x: x.capitalize() if x != "All Subjects" else x
+        )
+        
+        auto_save = st.checkbox("Auto-save to repository", value=True)
+    
+    if uploaded_file:
+        st.success(f"📄 **Uploaded:** {uploaded_file.name} ({uploaded_file.size / 1024:.1f} KB)")
+        
+        if st.button("🚀 Start AI Extraction", type="primary", use_container_width=True):
+            
+            # Create extractor
+            extractor = AIQuestionExtractor(api_key)
+            
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(value, message):
+                progress_bar.progress(value)
+                status_text.text(message)
+            
+            # Run extraction
+            target = target_subject if target_subject != "All Subjects" else None
+            
+            with st.spinner("AI is analyzing your document..."):
+                questions = extractor.process_complete_document(
+                    uploaded_file,
+                    target_subject=target,
+                    progress_callback=update_progress
+                )
+            
+            # Display log
+            st.markdown("### 📋 Extraction Log")
+            display_extraction_log(extractor.extraction_log)
+            
+            if not questions:
+                st.error("❌ No questions could be extracted. Please check the PDF format or try a different file.")
+                return
+            
+            # Store results
+            st.session_state['extracted_questions'] = questions
+            
+            # Summary
+            st.markdown("### 📊 Extraction Summary")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Questions", len(questions))
+            with col2:
+                with_answers = len([q for q in questions if q.correct_option])
+                st.metric("With Answers", with_answers)
+            with col3:
+                with_solutions = len([q for q in questions if q.solution])
+                st.metric("With Solutions", with_solutions)
+            with col4:
+                subjects = set(q.subject for q in questions)
+                st.metric("Subjects", len(subjects))
+            
+            # Subject breakdown
+            st.markdown("### 📚 Subject Breakdown")
+            subject_counts = defaultdict(int)
+            for q in questions:
+                subject_counts[q.subject] += 1
+            
+            cols = st.columns(4)
+            for i, (subj, config) in enumerate(SUBJECTS.items()):
+                with cols[i]:
+                    count = subject_counts.get(subj, 0)
+                    if count > 0:
+                        st.success(f"{config['icon']} {config['name']}: {count}")
+                    else:
+                        st.info(f"{config['icon']} {config['name']}: 0")
+    
+    # Display extracted questions
+    if 'extracted_questions' in st.session_state:
+        questions = st.session_state['extracted_questions']
+        
+        st.divider()
+        st.markdown("### 📝 Extracted Questions")
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            filter_subject = st.selectbox(
+                "Filter Subject",
+                ["All"] + list(set(q.subject for q in questions)),
+                key="filter_subj"
+            )
+        with col2:
+            filter_answer = st.selectbox(
+                "Answer Status",
+                ["All", "With Answer", "Without Answer"],
+                key="filter_ans"
+            )
+        with col3:
+            filter_solution = st.selectbox(
+                "Solution Status", 
+                ["All", "With Solution", "Without Solution"],
+                key="filter_sol"
+            )
+        
+        # Apply filters
+        filtered = questions
+        if filter_subject != "All":
+            filtered = [q for q in filtered if q.subject == filter_subject]
+        if filter_answer == "With Answer":
+            filtered = [q for q in filtered if q.correct_option]
+        elif filter_answer == "Without Answer":
+            filtered = [q for q in filtered if not q.correct_option]
+        if filter_solution == "With Solution":
+            filtered = [q for q in filtered if q.solution]
+        elif filter_solution == "Without Solution":
+            filtered = [q for q in filtered if not q.solution]
+        
+        st.info(f"Showing {len(filtered)} of {len(questions)} questions")
+        
+        # Display questions
+        for q in filtered[:30]:  # Limit display
+            with st.expander(f"Q{q.number}: {q.text[:80]}...", expanded=False):
+                display_question(q)
+        
+        if len(filtered) > 30:
+            st.warning(f"Showing first 30 of {len(filtered)} questions")
+        
+        # Save and Export
+        st.divider()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 💾 Save to Repository")
+            if st.button("Save All Questions", type="primary", use_container_width=True):
+                for q in questions:
+                    bank.add_question(q)
+                st.session_state.question_bank = bank
+                st.success(f"✅ Saved {len(questions)} questions!")
+                st.balloons()
+        
+        with col2:
+            st.markdown("### 📥 Export")
+            export_col1, export_col2, export_col3 = st.columns(3)
+            with export_col1:
+                st.download_button("JSON", create_export(questions, "json"), 
+                                  "questions.json", use_container_width=True)
+            with export_col2:
+                st.download_button("CSV", create_export(questions, "csv"),
+                                  "questions.csv", use_container_width=True)
+            with export_col3:
+                st.download_button("TXT", create_export(questions, "txt"),
+                                  "questions.txt", use_container_width=True)
+
+
+def manual_entry_page(subject: str, bank: QuestionBank, api_key: str):
+    """Manual question entry page"""
+    config = SUBJECTS[subject]
+    
+    st.markdown(f"""
+    <div style="background: {config['gradient']}; padding: 1.5rem; border-radius: 15px; color: white; margin-bottom: 1.5rem;">
+        <h3>{config['icon']} Add {config['name']} Question Manually</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    with st.form(f"manual_{subject}"):
+        question_text = st.text_area("Question Text *", height=100)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            option_a = st.text_input("Option A *")
+            option_c = st.text_input("Option C")
+        with col2:
+            option_b = st.text_input("Option B *")
+            option_d = st.text_input("Option D")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            correct = st.selectbox("Correct Answer *", ["", "A", "B", "C", "D"])
+        with col2:
+            topic = st.selectbox("Topic", [""] + config["topics"])
+        with col3:
+            difficulty = st.selectbox("Difficulty", ["medium", "easy", "hard"])
+        
+        solution = st.text_area("Solution (optional)", height=80)
+        
+        if st.form_submit_button("➕ Add Question", type="primary", use_container_width=True):
+            if question_text and option_a and option_b and correct:
+                q = Question(
+                    id=f"M{int(time.time())}",
+                    number=str(bank.get_subject_repo(subject).total_questions() + 1),
+                    text=question_text,
+                    options={"A": option_a, "B": option_b, "C": option_c, "D": option_d},
+                    correct_option=correct,
+                    solution=solution,
+                    subject=subject,
+                    topic=topic,
+                    difficulty=difficulty,
+                    source="manual"
+                )
+                bank.add_question(q)
+                st.session_state.question_bank = bank
+                st.success("✅ Question added!")
+                st.rerun()
+            else:
+                st.error("Please fill required fields (*)")
+
+
+def image_upload_page(subject: str, bank: QuestionBank, api_key: str):
+    """Image upload page"""
+    config = SUBJECTS[subject]
+    
+    st.markdown(f"""
+    <div style="background: {config['gradient']}; padding: 1.5rem; border-radius: 15px; color: white; margin-bottom: 1.5rem;">
+        <h3>{config['icon']} Upload {config['name']} Question Image</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if not api_key:
+        st.warning("⚠️ API key required for image extraction")
+        return
+    
+    uploaded = st.file_uploader("Upload image", type=['png', 'jpg', 'jpeg'], key=f"img_{subject}")
+    
+    if uploaded:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.image(uploaded, caption="Uploaded Image", use_column_width=True)
+        
+        with col2:
+            if st.button("🔍 Extract with AI", type="primary"):
+                with st.spinner("Extracting..."):
+                    extractor = AIImageExtractor(api_key)
+                    result = extractor.extract_from_image(uploaded.read())
+                    
+                    if result["success"]:
+                        data = result["data"]
+                        st.success("✅ Extracted!")
+                        
+                        st.write(f"**Question:** {data.get('question_text', '')}")
+                        st.write("**Options:**")
+                        for opt, val in data.get("options", {}).items():
+                            st.write(f"({opt}) {val}")
+                        
+                        if st.button("💾 Save Question"):
+                            q = Question(
+                                id=f"I{int(time.time())}",
+                                number=str(bank.get_subject_repo(subject).total_questions() + 1),
+                                text=data.get("question_text", ""),
+                                options=data.get("options", {}),
+                                correct_option=data.get("correct_option", "").upper(),
+                                solution=data.get("solution", ""),
+                                subject=subject,
+                                topic=data.get("topic", ""),
+                                source="image"
+                            )
+                            bank.add_question(q)
+                            st.session_state.question_bank = bank
+                            st.success("✅ Saved!")
+                    else:
+                        st.error(f"Error: {result.get('error')}")
+
+
+def repository_view_page(subject: str, bank: QuestionBank):
+    """View repository page"""
+    config = SUBJECTS[subject]
+    repo = bank.get_subject_repo(subject)
+    
+    st.markdown(f"""
+    <div style="background: {config['gradient']}; padding: 2rem; border-radius: 15px; color: white; margin-bottom: 1.5rem;">
+        <h2>{config['icon']} {config['name']} Repository</h2>
+        <p>{repo.total_questions()} questions</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if not repo.questions:
+        st.info("No questions yet. Upload a PDF or add manually!")
+        return
+    
+    # Stats
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total", repo.total_questions())
+    with col2:
+        st.metric("With Answers", len([q for q in repo.questions if q.correct_option]))
+    with col3:
+        st.metric("With Solutions", len([q for q in repo.questions if q.solution]))
+    
+    # Topic distribution
+    if repo.topics:
+        st.subheader("📊 Topics")
+        topic_data = {t: len(qs) for t, qs in repo.topics.items()}
+        st.bar_chart(pd.DataFrame(list(topic_data.items()), columns=['Topic', 'Count']).set_index('Topic'))
+    
+    st.divider()
+    
+    # Questions list
+    st.subheader("📋 Questions")
+    
+    for q in repo.questions[:50]:
+        with st.expander(f"Q{q.number}: {q.text[:70]}..."):
+            display_question(q)
+    
+    # Export
+    st.divider()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button("📄 JSON", create_export(repo.questions, "json"), f"{subject}.json", use_container_width=True)
+    with col2:
+        st.download_button("📊 CSV", create_export(repo.questions, "csv"), f"{subject}.csv", use_container_width=True)
+    with col3:
+        st.download_button("📝 TXT", create_export(repo.questions, "txt"), f"{subject}.txt", use_container_width=True)
+
+
+def generate_test_page(bank: QuestionBank):
+    """Generate test page"""
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%); 
+                padding: 2rem; border-radius: 15px; color: white; text-align: center; margin-bottom: 1.5rem;">
+        <h2>📝 Generate Custom Test</h2>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if bank.total_questions() == 0:
+        st.warning("No questions in repository. Extract questions first!")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        counts = {}
+        for subj, config in SUBJECTS.items():
+            available = bank.get_subject_repo(subj).total_questions()
+            counts[subj] = st.slider(f"{config['icon']} {config['name']} ({available})", 
+                                    0, min(30, available), min(5, available))
+    
+    with col2:
+        test_name = st.text_input("Test Name", "Practice Test")
+        shuffle = st.checkbox("Shuffle Questions", True)
+        only_with_answers = st.checkbox("Only include questions with answers", True)
+    
+    total = sum(counts.values())
+    st.info(f"Total: {total} questions")
+    
+    if st.button("📝 Generate", type="primary", use_container_width=True):
+        test = []
+        for subj, count in counts.items():
+            if count <= 0:
+                continue
+            questions = bank.get_subject_repo(subj).questions
+            if only_with_answers:
+                questions = [q for q in questions if q.correct_option]
+            if questions:
+                test.extend(random.sample(questions, min(count, len(questions))))
+        
+        if shuffle:
+            random.shuffle(test)
+        
+        for i, q in enumerate(test, 1):
+            q.number = str(i)
+        
+        st.session_state.generated_test = test
+        st.success(f"Generated {len(test)} questions!")
+    
+    if 'generated_test' in st.session_state:
+        test = st.session_state.generated_test
+        
+        st.divider()
+        for q in test:
+            with st.expander(f"Q{q.number}: {q.text[:60]}..."):
+                display_question(q)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("📄 Full Test", create_export(test, "txt"), "test.txt", use_container_width=True)
+        with col2:
+            key = "\n".join([f"Q{q.number}: {q.correct_option}" for q in test if q.correct_option])
+            st.download_button("🔑 Answer Key", key, "answers.txt", use_container_width=True)
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+def main():
+    """Main application"""
+    
+    # Initialize
+    if 'question_bank' not in st.session_state:
+        st.session_state.question_bank = QuestionBank()
+    
+    bank = st.session_state.question_bank
+    
+    # Header
+    st.markdown('<h1 class="main-header">🤖 AI Question Bank Extractor</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Powered by GPT-4 • Extracts Questions, Options, Answers & Solutions</p>', unsafe_allow_html=True)
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("🔑 API Configuration")
+        api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            help="Required for AI extraction"
+        )
+        
+        if api_key:
+            st.success("✅ API Key configured")
+        else:
+            st.error("❌ API Key required")
+            st.markdown("[Get API Key →](https://platform.openai.com/api-keys)")
+        
+        st.divider()
+        
+        st.header("📊 Repository")
+        st.write(f"**Total:** {bank.total_questions()}")
+        for subj, config in SUBJECTS.items():
+            count = bank.get_subject_repo(subj).total_questions()
+            st.write(f"{config['icon']} {config['name']}: {count}")
+    
+    # Stats
+    display_stats(bank)
+    st.divider()
+    
+    # Main tabs
+    main_tabs = st.tabs([
+        "📤 Extract from PDF",
+        "⚛️ Physics",
+        "🧪 Chemistry",
+        "📐 Mathematics", 
+        "🧬 Biology",
+        "📝 Generate Test"
+    ])
+    
+    with main_tabs[0]:
+        pdf_extraction_page(bank, api_key)
+    
+    for i, (subj, config) in enumerate(SUBJECTS.items()):
+        with main_tabs[i + 1]:
+            subtabs = st.tabs(["📋 View Repository", "✏️ Add Manually", "🖼️ Upload Image"])
+            
+            with subtabs[0]:
+                repository_view_page(subj, bank)
+            with subtabs[1]:
+                manual_entry_page(subj, bank, api_key)
+            with subtabs[2]:
+                image_upload_page(subj, bank, api_key)
+    
+    with main_tabs[5]:
+        generate_test_page(bank)
+    
+    # Footer
+    st.divider()
+    st.markdown('<p style="text-align: center; color: #888;">🤖 AI Question Bank Extractor v3.0</p>', unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
 
